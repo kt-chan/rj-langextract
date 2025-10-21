@@ -1,0 +1,19 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger",
+            "type": "debugpy",
+            "request": "launch",
+            // "program": "ch_med.py",
+            // "program": "ch_chem.py",
+            // "program": "extractor/mineru-extractor.py",
+            // "program": "extractor/unstructured-extractor.py",
+            "program": "lang_extract/pis_report.py",
+            "console": "integratedTerminal"
+        }
+    ]
+}

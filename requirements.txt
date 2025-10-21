@@ -1,0 +1,41 @@
+# # Utility libraries
+# beautifulsoup4>=4.13.5
+# chromadb>=1.0.21
+# Core MinerU
+# Core unstructured library with PDF support
+# langchain>=0.3.27
+# openai>=1.107.1
+# pandas>=2.3.2
+# python-magic>=0.4.0
+# unstructured-client>=0.18.4
+# unstructured-inference>=1.0.5
+# unstructured[pdf]>=0.18.4
+# unstructured>=0.18.4
+# MinerU
+# langextract
+# pydantic
+# python-dotenv
+# magic-pdf[full]==1.3.9
+# fastapi
+# uvicorn
+# python-multipart
+# requests>=2.32.3
+# modelscope>=1.25.0
+
+# 数据处理和结构化存储
+requests>=2.32.3          # http request
+pandas==2.3.3             # 用于读取和处理 CSV 文件
+pydantic                  # 用于定义数据模式（Schemas）和数据验证
+
+# 核心的文本结构化提取工具
+langextract==1.0.9        # Google LLM 驱动的信息提取库
+openpyxl==3.1.5
+
+# LLM 后端依赖 (根据您选择的 LLM 提供商，选择性安装)
+# 如果您使用 OpenAI 作为 LangExtract 的后端（推荐使用 >=1.0.0 版本）：
+openai==2.6.0
+# 如果您使用 Anthropic 作为 LangExtract 的后端，可能还需要：
+# anthropic>=0.2.0
+
+# 其他通用库（可选）
+python-dotenv           # 用于安全加载 API 密钥和配置
