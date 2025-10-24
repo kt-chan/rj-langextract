@@ -39,3 +39,5 @@ openai==2.6.0
 
 # 其他通用库（可选）
 python-dotenv           # 用于安全加载 API 密钥和配置
+pip-system-certs
+truststore

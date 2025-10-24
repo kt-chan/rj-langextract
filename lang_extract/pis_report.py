@@ -1,3 +1,4 @@
+import re
 import langextract as lx
 import json
 import pandas as pd
@@ -5,18 +6,34 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 import logging
 import os
+import sys
 from datetime import datetime
+import asyncio
 from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from langextract_glmprovider.provider import GLMProviderLanguageModel, GLMProviderSchema
 
 # ====================================================================
 # 1. Configuration and Setup
 # ====================================================================
+current_datetime = datetime.now().strftime("%Y%m%d-%H%M%S")
+
 LLM_API_KEY = None
 LLM_BASE_URL = None
-LLM_PROVIDER = None
+LLM_MODEL_ID = None
+CSV_FILE_PATH = "data/ruijin/Breast-20251021092802.xlsx"
+TEXT_COLUMN = "病理诊断"
+OUTPUT_JSON = f"data/ruijin/{current_datetime}/pathology_extraction_results.json"
+OUTPUT_CSV = f"data/ruijin/{current_datetime}/pathology_extraction_summary.csv"
+SAMPLE_SIZE = 50  # 开始时使用小样本测试
+BATCH_SIZE = 10  # 控制并发请求数
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -35,384 +52,43 @@ COLUMN_MAPPING = {
 
 def configure_environment():
 
-    global LLM_API_KEY, LLM_BASE_URL, LLM_PROVIDER
+    global LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_ID
 
     """配置环境变量"""
     load_dotenv()
 
-    # 设置API密钥:cite[1]
+    # 设置环境变量
     LLM_API_KEY = os.getenv("LLM_API_KEY")
     LLM_BASE_URL = os.getenv("LLM_BASE_URL")
-    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
+    LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "glm-4-flash")
 
     if not LLM_API_KEY:
         logger.warning("未找到LLM_API_KEY环境变量，请检查.env文件配置")
     else:
-        logger.info(f"API密钥已加载，使用Provider: {LLM_PROVIDER}")
-
-
-# ====================================================================
-# 2. 重新定义数据模型以适应LangExtract格式:cite[1]
-# ====================================================================
-
-
-def create_pathology_examples():
-        """创建病理报告提取示例，基于真实样本数据"""
-        
-        examples = []
-        
-        # 示例1：基于第一个样本
-        example_text1 = """标本类型：左乳6点肿物扩大切除标本
-    肿物大小2.0×2.0×1.3cm；
-    组织学类型：浸润性癌，非特殊类型；
-    组织学分级：Ⅲ级
-    （腺管形成3分 + 核多形性3分 + 核分裂象3分 = 9分）
-    肿瘤累及范围：脉管侵犯：（-） 
-    保乳手术切缘情况：上切缘：请参见病理报告F2025-017418； 下切缘：请参见病理报告F2025-017418； 内切缘：请参见病理报告F2025-017418； 外切缘：请参见病理报告F2025-017418； 
-    伴发病变：
-    肿瘤间质浸润淋巴细胞（sTILs）：50%。
-    免疫组化及特殊染色检查：（特检编号: A2025-26052）
-    浸润性癌细胞：ER（-）, PR（-）, HER2（0，无染色）, Ki67（90%+）, AR（-）, GATA-3（部分弱+）, E-Cadherin（+）, P120（膜+）, CK5/6（-）, EGFR（+）, P63（散在弱+）, SOX-10（部分弱+）, AE1/AE3（+）。
-    pTNM分期：pT1cN0Mx
-    补充说明：淋巴结信息参考病理报告F2025-017433综合评估。"""
-
-        examples.append(
-            lx.data.ExampleData(
-                text=example_text1,
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="specimen_type",
-                        extraction_text="左乳6点肿物扩大切除标本",
-                        attributes={"location": "左乳", "procedure": "扩大切除"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="tumor_size",
-                        extraction_text="2.0×2.0×1.3cm",
-                        attributes={"dimensions": "2.0×2.0×1.3cm", "unit": "cm"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="histologic_type",
-                        extraction_text="浸润性癌，非特殊类型",
-                        attributes={"type": "浸润性癌", "subtype": "非特殊类型"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="histologic_grade",
-                        extraction_text="Ⅲ级",
-                        attributes={"grade": "Ⅲ级", "score": "9分"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="er_status",
-                        extraction_text="ER（-）",
-                        attributes={"result": "阴性"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="her2_status",
-                        extraction_text="HER2（0，无染色）",
-                        attributes={"score": "0", "result": "阴性", "description": "无染色"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ki67_rate",
-                        extraction_text="Ki67（90%+）",
-                        attributes={"percentage": "90%", "intensity": "+"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="margin_status",
-                        extraction_text="上切缘：请参见病理报告F2025-017418",
-                        attributes={"margin": "上切缘", "status": "需参考其他报告"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="stils_rate",
-                        extraction_text="肿瘤间质浸润淋巴细胞（sTILs）：50%",
-                        attributes={"percentage": "50%"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ptnm_stage",
-                        extraction_text="pT1cN0Mx",
-                        attributes={"T": "T1c", "N": "N0", "M": "Mx"},
-                    ),
-                ],
-            )
-        )
-        
-        # 示例2：基于第二个样本
-        example_text2 = """标本类型：右乳癌保乳根治标本
-    肿瘤大小：单灶，大小1.7×1.5×0.8cm
-    组织学类型：（冰冻剩余组织）浸润性癌，非特殊类型,伴部分中级别导管原位癌
-    组织学分级：Ⅲ级
-    （腺管形成3分 + 核多形性3分 + 核分裂象2分 = 8分）
-    肿瘤累及范围：脉管侵犯：（-） 皮肤：（-） 
-    保乳手术切缘情况：上切缘：详见报告F2025-017452 下切缘：详见报告F2025-017452 内切缘：详见报告F2025-017452 外切缘：详见报告F2025-017452 
-    伴发病变：其余乳腺组织硬化性腺病，间质纤维化，散在微钙化
-    免疫组化及特殊染色检查：（特检编号: A2025-25887）浸润性癌细胞ER（95%+，染色中等-强）, PR（约50%+，染色中等-强）, HER2（2+）, Ki67（约20%+）， E-Cadherin（+）, CK5/6（-）, P120（胞膜+）, GATA-3（+）,  CgA（-）, SYN（-）； P63（-）, Calponin（-）示癌巢周围肌上皮缺失。原位癌细胞ER（95%+，染色中等-强）, PR（约50%+，染色"""
-        
-        examples.append(
-            lx.data.ExampleData(
-                text=example_text2,
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="tumor_size",
-                        extraction_text="1.7×1.5×0.8cm",
-                        attributes={"dimensions": "1.7×1.5×0.8cm", "unit": "cm", "foci": "单灶"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="histologic_type",
-                        extraction_text="浸润性癌，非特殊类型,伴部分中级别导管原位癌",
-                        attributes={"invasive_type": "浸润性癌，非特殊类型", "dcis_type": "中级别导管原位癌"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="histologic_grade",
-                        extraction_text="Ⅲ级",
-                        attributes={"grade": "Ⅲ级", "score": "8分"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="er_status",
-                        extraction_text="ER（95%+，染色中等-强）",
-                        attributes={"percentage": "95%+", "intensity": "中等-强", "result": "阳性"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="pr_status",
-                        extraction_text="PR（约50%+，染色中等-强）",
-                        attributes={"percentage": "约50%+", "intensity": "中等-强", "result": "阳性"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="her2_status",
-                        extraction_text="HER2（2+）",
-                        attributes={"score": "2+", "result": "需进一步检测"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ki67_rate",
-                        extraction_text="Ki67（约20%+）",
-                        attributes={"percentage": "约20%+", "intensity": "+"},
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="myoepithelial_status",
-                        extraction_text="P63（-）, Calponin（-）示癌巢周围肌上皮缺失",
-                        attributes={"p63": "阴性", "calponin": "阴性", "result": "肌上皮缺失"},
-                    ),
-                ],
-            )
-        )
-        
-        return examples
-
-
-def create_pathology_graph_examples():
-        """创建病理报告关系提取示例，基于真实样本数据"""
-        
-        examples = []
-        
-        # 示例1：基于第一个样本
-        example_text1 = """标本类型：左乳6点肿物扩大切除标本
-    肿物大小2.0×2.0×1.3cm；
-    组织学类型：浸润性癌，非特殊类型；
-    组织学分级：Ⅲ级
-    （腺管形成3分 + 核多形性3分 + 核分裂象3分 = 9分）
-    肿瘤累及范围：脉管侵犯：（-） 
-    免疫组化及特殊染色检查：（特检编号: A2025-26052）
-    浸润性癌细胞：ER（-）, PR（-）, HER2（0，无染色）, Ki67（90%+）"""
-        
-        examples.append(
-            lx.data.ExampleData(
-                text=example_text1,
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="组织学分级：Ⅲ级",
-                        attributes={
-                            "head": "浸润性癌",
-                            "relationship": "具有分级",
-                            "tail": "Ⅲ级",
-                            "type": "分级关系",
-                            "score": "9分"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="ER（-）",
-                        attributes={
-                            "head": "ER",
-                            "relationship": "表达状态",
-                            "tail": "阴性",
-                            "type": "免疫组化标记",
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="HER2（0，无染色）",
-                        attributes={
-                            "head": "HER2",
-                            "relationship": "表达状态",
-                            "tail": "阴性",
-                            "type": "免疫组化标记",
-                            "score": "0"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="Ki67（90%+）",
-                        attributes={
-                            "head": "Ki67",
-                            "relationship": "增殖指数",
-                            "tail": "90%",
-                            "type": "增殖标记",
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="脉管侵犯：（-）",
-                        attributes={
-                            "head": "肿瘤",
-                            "relationship": "脉管侵犯状态",
-                            "tail": "阴性",
-                            "type": "侵犯关系",
-                        },
-                    ),
-                ],
-            )
-        )
-        
-        # 示例2：基于第二个样本
-        example_text2 = """标本类型：右乳癌保乳根治标本
-    肿瘤大小：单灶，大小1.7×1.5×0.8cm
-    组织学类型：（冰冻剩余组织）浸润性癌，非特殊类型,伴部分中级别导管原位癌
-    组织学分级：Ⅲ级
-    （腺管形成3分 + 核多形性3分 + 核分裂象2分 = 8分）
-    免疫组化及特殊染色检查：浸润性癌细胞ER（95%+，染色中等-强）, PR（约50%+，染色中等-强）, HER2（2+）, Ki67（约20%+）"""
-        
-        examples.append(
-            lx.data.ExampleData(
-                text=example_text2,
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="组织学分级：Ⅲ级",
-                        attributes={
-                            "head": "浸润性癌",
-                            "relationship": "具有分级",
-                            "tail": "Ⅲ级",
-                            "type": "分级关系",
-                            "score": "8分"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="ER（95%+，染色中等-强）",
-                        attributes={
-                            "head": "ER",
-                            "relationship": "表达状态",
-                            "tail": "阳性",
-                            "type": "免疫组化标记",
-                            "percentage": "95%+",
-                            "intensity": "中等-强"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="PR（约50%+，染色中等-强）",
-                        attributes={
-                            "head": "PR",
-                            "relationship": "表达状态",
-                            "tail": "阳性",
-                            "type": "免疫组化标记",
-                            "percentage": "约50%+",
-                            "intensity": "中等-强"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="HER2（2+）",
-                        attributes={
-                            "head": "HER2",
-                            "relationship": "表达状态",
-                            "tail": "可疑阳性",
-                            "type": "免疫组化标记",
-                            "score": "2+"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="伴部分中级别导管原位癌",
-                        attributes={
-                            "head": "浸润性癌",
-                            "relationship": "伴随病变",
-                            "tail": "中级别导管原位癌",
-                            "type": "伴随关系",
-                        },
-                    ),
-                ],
-            )
-        )
-        
-        # 示例3：基于第三个样本（小叶癌）
-        example_text3 = """标本类型：左乳癌保乳切除标本
-    肿物大小1.6×1.5×1.0cm；
-    组织学类型：多形性浸润性小叶癌；
-    组织学分级：Ⅲ级
-    （腺管形成3分 + 核多形性3分 + 核分裂象3分 = 9分）
-    免疫组化及特殊染色检查：
-    浸润性癌细胞：ER（80%+，染色中等-强）, PR（95%+，染色强）, HER2（3+）, Ki67（约20%+）"""
-        
-        examples.append(
-            lx.data.ExampleData(
-                text=example_text3,
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="组织学类型：多形性浸润性小叶癌",
-                        attributes={
-                            "head": "肿瘤",
-                            "relationship": "组织学类型",
-                            "tail": "多形性浸润性小叶癌",
-                            "type": "类型关系",
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="ER（80%+，染色中等-强）",
-                        attributes={
-                            "head": "ER",
-                            "relationship": "表达状态",
-                            "tail": "阳性",
-                            "type": "免疫组化标记",
-                            "percentage": "80%+",
-                            "intensity": "中等-强"
-                        },
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="relationship",
-                        extraction_text="HER2（3+）",
-                        attributes={
-                            "head": "HER2",
-                            "relationship": "表达状态",
-                            "tail": "阳性",
-                            "type": "免疫组化标记",
-                            "score": "3+"
-                        },
-                    ),
-                ],
-            )
-        )
-        
-        return examples
+        logger.info(f"API密钥已加载，使用Provider: {LLM_MODEL_ID}")
 
 
 def create_pathology_prompt():
     """创建病理报告提取提示"""
     prompt = """
     从乳腺癌病理诊断报告中提取以下关键信息：
-    1. 肿瘤大小（浸润性肿瘤的最大三维尺寸，格式为XxYxZcm）
-    2. 组织学类型（如：浸润性癌，非特殊类型）
-    3. 组织学分级（如：I级、II级、III级）
-    4. ER状态（雌激素受体表达百分比和强度）
-    5. HER2状态（HER2表达状态和评分）
-    6. Ki67指数（增殖百分比）
-    7. 切缘状态（保乳手术切缘的总体状态）
+    1. 肿瘤标签（存在肿瘤、无肿瘤）
+    2. 肿瘤大小（浸润性肿瘤的最大三维尺寸，格式为XxYxZcm）
+    3. 组织学主类型（如：未分类、纤维上皮肿瘤、上皮源性肿瘤、间叶源性肿瘤、浸润性癌、原位癌、转移性癌、转移性乳腺癌）
+    4. 组织学类型（如：浸润性癌，非特殊类型l;浸润性小叶癌,黏液性癌,浸润性乳头状癌,微乳头状癌,大汗腺癌,化生性癌,淋巴上皮瘤样癌,炎症性癌,透明细胞癌,梭形细胞癌,腺样囊性癌）
+    5. 组织学分级（如：I级、II级、III级），并提取相关指标（如：腺管形成3分 + 核多形性3分 + 核分裂象3分 = 9分）
+    6. 肿瘤累及范围（如：脉管侵犯：（-） 皮肤：（-） 乳头：（+） 基底：（-） ）
+    7. 其余象限乳腺组织：（如：内上象限：（+） 内下象限：（-） 外上象限：（-） 外下象限：（-） ）
+    8. 保乳手术切缘情况
+    9. 免疫组化及特殊染色检查
+    10. pTNM分期(如：pT2N0Mx）
     
     要求：
     - 使用报告中的精确文本进行提取
     - 不要释义或改写原文
     - 为每个提取项提供有意义的属性
     - 确保所有数值和结果准确对应原文
+    - 确保所有输出的数值和结果都能在对应原文找到
     """
     return prompt
 
@@ -432,6 +108,161 @@ def create_pathology_graph_prompt():
     - 为每个三元组提供清晰的属性
     """
     return prompt
+
+
+class PathologyExamples:
+    """
+    A single comprehensive example with a generalized schema for breast cancer pathology reports.
+    Based on the provided comprehensive_text input, focusing on 7 key extraction classes.
+    """
+
+    @staticmethod
+    def _create_extraction(
+        class_name: str, text: str, attributes: dict
+    ) -> lx.data.Extraction:
+        """Helper function to create a standardized Extraction object."""
+        return lx.data.Extraction(
+            extraction_class=class_name,
+            extraction_text=text,
+            attributes=attributes,
+        )
+
+    @staticmethod
+    def get_examples() -> List[lx.data.ExampleData]:
+        """
+        从乳腺癌病理诊断报告中提取以下关键信息（共10项）：
+        1. 肿瘤标签（存在肿瘤、无肿瘤）
+        2. 肿瘤大小（浸润性肿瘤的最大三维尺寸，格式为XxYxZcm）
+        3. 组织学主类型
+        4. 组织学类型
+        5. 组织学分级
+        6. 肿瘤累及范围
+        7. 其余象限乳腺组织
+        8. 保乳手术切缘情况
+        9. 免疫组化及特殊染色检查
+        10. pTNM分期
+        """
+
+        comprehensive_text = (
+            "标本类型:左乳6点肿物扩大切除标本;\n"
+            "肿物大小2.0×2.0×1.3cm;\n"
+            "组织学类型:浸润性癌,非特殊类型;\n"
+            "组织学分级:Ⅲ级;(腺管形成3分+核多形性3分+核分裂象3分=9分);\n"
+            "肿瘤累及范围:脉管侵犯:(阴性);\n"
+            "保乳手术切缘情况:上切缘:参考其他报告;下切缘:参考其他报告;内切缘:参考其他报告;外切缘:参考其他报告;\n"
+            "伴发病变:无;\n"
+            "肿瘤间质浸润淋巴细胞(sTILs):50%;\n"
+            "免疫组化及特殊染色检查:(特检编号:A2025-26052);\n"
+            "浸润性癌细胞:ER(阴性),PR(阴性),HER2(0,无染色),Ki67(90%+),AR(阴性),GATA-3(部分弱+),"
+            "E-Cadherin(阳性),P120(膜+),CK5/6(阴性),EGFR(阳性),P63(散在弱+),SOX-10(部分弱+),AE1/AE3(阳性);\n"
+            "pTNM分期:pT1cN0Mx;\n"
+            "补充说明:淋巴结信息参考病理报告F2025-017433综合评估;"
+        )
+
+        examples = [
+            lx.data.ExampleData(
+                text=comprehensive_text,
+                extractions=[
+                    # 1. 肿瘤标签
+                    PathologyExamples._create_extraction(
+                        "tumor_presence",
+                        "存在肿瘤",
+                        {"result": "存在肿瘤"},
+                    ),
+                    # 2. 肿瘤大小
+                    PathologyExamples._create_extraction(
+                        "tumor_size",
+                        "2.0×2.0×1.3cm",
+                        {
+                            "dimensions": "2.0x2.0x1.3",
+                            "unit": "cm",
+                        },
+                    ),
+                    # 3. 组织学主类型
+                    PathologyExamples._create_extraction(
+                        "histological_main_type",
+                        "上皮源性肿瘤",
+                        {"category": "上皮源性肿瘤"},
+                    ),
+                    # 4. 组织学类型
+                    PathologyExamples._create_extraction(
+                        "histological_type",
+                        "浸润性癌,非特殊类型",
+                        {
+                            "classification": "浸润性癌",
+                            "subtype": "非特殊类型",
+                        },
+                    ),
+                    # 5. 组织学分级
+                    PathologyExamples._create_extraction(
+                        "histological_grade",
+                        "Ⅲ级;(腺管形成3分+核多形性3分+核分裂象3分=9分)",
+                        {
+                            "grade": "III",
+                            "tubule_formation": "3",
+                            "nuclear_pleomorphism": "3",
+                            "mitotic_count": "3",
+                            "total_score": "9",
+                        },
+                    ),
+                    # 6. 肿瘤累及范围
+                    PathologyExamples._create_extraction(
+                        "tumor_extent",
+                        "脉管侵犯:(阴性)",
+                        {
+                            "vascular_invasion": "阴性",
+                            "skin": "N/A",
+                            "nipple": "N/A",
+                            "base": "N/A",
+                        },
+                    ),
+                    # 7. 其余象限乳腺组织
+                    PathologyExamples._create_extraction(
+                        "other_quadrants",
+                        "N/A",
+                        {
+                            "upper_inner": "N/A",
+                            "lower_inner": "N/A",
+                            "upper_outer": "N/A",
+                            "lower_outer": "N/A",
+                        },
+                    ),
+                    # 8. 保乳手术切缘情况
+                    PathologyExamples._create_extraction(
+                        "margin_status",
+                        "上切缘:参考其他报告;下切缘:参考其他报告;内切缘:参考其他报告;外切缘:参考其他报告;",
+                        {
+                            "overall_status": "未评估/需参考其他报告",
+                            "superior_margin": "参考其他报告",
+                            "inferior_margin": "参考其他报告",
+                            "medial_margin": "参考其他报告",
+                            "lateral_margin": "参考其他报告",
+                        },
+                    ),
+                    # 9. 免疫组化及特殊染色检查
+                    PathologyExamples._create_extraction(
+                        "immunohistochemistry",
+                        "ER(阴性),PR(阴性),HER2(0,无染色),Ki67(90%+)",
+                        {
+                            "ER": "阴性",
+                            "PR": "阴性",
+                            "HER2": "0 (无染色)",
+                            "Ki67": "90%",
+                            "other_markers": "N/A",
+                        },
+                    ),
+                    # 10. pTNM分期
+                    PathologyExamples._create_extraction(
+                        "pTNM_stage",
+                        "pT1cN0Mx",
+                        {"T": "1c", "N": "0", "M": "x"},
+                    ),
+                ],
+            )
+        ]
+
+        return examples
+
 
 # ====================================================================
 # 3. 核心处理管道类（修改版）
@@ -524,8 +355,8 @@ class ReportProcessingPipeline:
                 continue
 
             # 增强数据清洗
-            cleaned_text = self._clean_report_text(str(report_text))
-            
+            cleaned_text = clean_report_text(str(report_text))
+
             if not cleaned_text.strip():
                 empty_count += 1
                 continue
@@ -549,49 +380,16 @@ class ReportProcessingPipeline:
         logger.info(f"成功加载{len(reports)}份有效报告")
         return reports
 
-    def _clean_report_text(self, text: str) -> str:
-        """清洗报告文本"""
-        if not text:
-            return ""
-        
-        # 替换不可见字符和多余空白
-        text = text.replace('\xa0', ' ')  # 替换 &nbsp;
-        text = text.replace('\u3000', ' ')  # 替换全角空格
-        
-        # 标准化换行符和空白字符
-        lines = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                # 合并连续的多个空格
-                line = ' '.join(line.split())
-                lines.append(line)
-        
-        cleaned_text = '\n'.join(lines)
-        
-        # 处理标本类型中的引号
-        cleaned_text = cleaned_text.replace('标本类型："', '标本类型：')
-        cleaned_text = cleaned_text.replace('"标本类型：', '标本类型：')
-        
-        return cleaned_text
-
     # --- 修改的提取方法 ---
     @staticmethod
-    def run_ner_extraction(report_text: str) -> Dict[str, Any]:
+    async def run_ner_extraction(report_text: str) -> Dict[str, Any]:
         """使用新版LangExtract API执行NER提取:cite[1]"""
         try:
             prompt = create_pathology_prompt()
-            examples = create_pathology_examples()
+            examples = PathologyExamples().get_examples()
 
-            result = lx.extract(
-                text_or_documents=report_text,
-                prompt_description=prompt,
-                examples=examples,
-                extraction_passes=2,  # 多次提取提高召回率:cite[9]
-                max_workers=4,  # 并行处理
-                model_id=LLM_PROVIDER,
-                api_key=LLM_API_KEY,  # Only use this for testing/development
-                model_url=LLM_BASE_URL,
+            result = await run_extraction_execution_native_async(
+                report_text, prompt, examples
             )
 
             # 转换结果为字典格式
@@ -613,21 +411,15 @@ class ReportProcessingPipeline:
             return {"error": str(e), "status": "error"}
 
     @staticmethod
-    def run_graph_extraction(report_text: str) -> List[Dict[str, Any]]:
+    async def run_graph_extraction(report_text: str) -> List[Dict[str, Any]]:
         """使用新版LangExtract API执行图提取"""
         try:
             graph_prompt = create_pathology_graph_prompt()
 
-            graph_examples = create_pathology_graph_examples()
+            graph_examples = PathologyExamples.get_examples()
 
-            result = lx.extract(
-                text_or_documents=report_text,
-                prompt_description=graph_prompt,
-                examples=graph_examples,
-                extraction_passes=2,
-                model_id=LLM_PROVIDER,
-                api_key=LLM_API_KEY,  # Only use this for testing/development
-                model_url=LLM_BASE_URL,
+            result = await run_extraction_execution_native_async(
+                report_text, graph_prompt, graph_examples
             )
 
             triples = []
@@ -648,35 +440,37 @@ class ReportProcessingPipeline:
             logger.error(f"图提取失败: {str(e)}")
             return [{"error": str(e)}]
 
-    # --- 批量处理方法保持不变 ---
-    def process_reports_batch(
+    # --- 异步批量处理方法 ---
+    async def process_reports_batch(
         self,
         text_column: str = None,
         output_file: str = "extraction_results.json",
         sample_size: Optional[int] = None,
         batch_size: Optional[int] = None,
+        max_concurrent: int = 3,  # 控制并发数，避免压垮外部服务
+        file_mode: str = "w",  # "w" for overwrite, "a" for append
     ) -> List[Dict[str, Any]]:
-        """核心：批量处理病理报告，调用抽取函数"""
+        """核心：批量处理病理报告，调用抽取函数（异步并行版本）"""
         reports = self.load_reports(text_column=text_column, sample_size=sample_size)
 
         if not reports:
             logger.error("没有可处理的报告数据")
             return []
 
-        results = []
-        total_reports = len(reports)
+        # 创建信号量来限制并发外部服务调用
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-        pathology_id_col = self.column_map.get("pathology_id", "N/A")
-
-        for i, report_data in enumerate(reports):
-            report_id = report_data["metadata"].get(pathology_id_col, "N/A")
-            logger.info(f"处理进度: {i+1}/{total_reports} - 病理号: {report_id}")
+        async def process_single_report(report_data: Dict[str, Any]) -> Dict[str, Any]:
+            """处理单个报告的异步函数"""
+            report_id = report_data["metadata"].get("pathology_id", "N/A")
 
             try:
                 report_text = report_data["report_text"]
 
-                ner_result = self.run_ner_extraction(report_text)
-                graph_result = self.run_graph_extraction(report_text)
+                # 使用信号量限制并发外部服务调用
+                async with semaphore:
+                    ner_result = await self.run_ner_extraction(report_text)
+                    # graph_result = await self.run_graph_extraction(report_text)  # If also async
 
                 result = {
                     "row_index": report_data["row_index"],
@@ -687,42 +481,110 @@ class ReportProcessingPipeline:
                         else report_text
                     ),
                     "ner_extraction": ner_result,
-                    "graph_extraction": graph_result,
-                    "graph_triples_count": (
-                        len(graph_result) if isinstance(graph_result, list) else 0
-                    ),
+                    # "graph_extraction": graph_result,
+                    # "graph_triples_count": (
+                    #     len(graph_result) if isinstance(graph_result, list) else 0
+                    # ),
                     "status": "success",
                     "processing_time": datetime.now().isoformat(),
                 }
-                results.append(result)
-
-                if batch_size and (i + 1) % batch_size == 0:
-                    interim_file = f"interim_{output_file}"
-                    self._save_results_to_file(results, interim_file)
+                return result
 
             except Exception as e:
                 logger.error(f"处理失败(行{report_data['row_index']}): {str(e)}")
-                results.append(
-                    {
-                        "row_index": report_data["row_index"],
-                        "metadata": report_data["metadata"],
-                        "error": str(e),
-                        "status": "error",
-                        "processing_time": datetime.now().isoformat(),
-                    }
-                )
+                return {
+                    "row_index": report_data["row_index"],
+                    "metadata": report_data["metadata"],
+                    "error": str(e),
+                    "status": "error",
+                    "processing_time": datetime.now().isoformat(),
+                }
 
-        self._save_results_to_file(results, output_file)
+        # 并发处理所有报告
+        tasks = []
+        total_reports = len(reports)
+
+        for i, report_data in enumerate(reports):
+            report_id = report_data["metadata"].get("pathology_id", "N/A")
+            logger.info(f"提交任务: {i+1}/{total_reports} - 病理号: {report_id}")
+
+            task = asyncio.create_task(process_single_report(report_data))
+            tasks.append(task)
+
+        # 等待所有任务完成并收集结果
+        results = []
+        try:
+            # 按完成顺序处理结果
+            for i, completed_task in enumerate(asyncio.as_completed(tasks)):
+                result = await completed_task
+                results.append(result)
+
+                # 记录进度
+                completed_count = i + 1
+
+                logger.info("#" * 64)
+                logger.info(f"完成进度: {completed_count}/{total_reports}")
+                logger.info("#" * 64)
+
+                # 如果指定了batch_size，保存临时结果
+                if batch_size and completed_count % batch_size == 0:
+                    interim_file = f"interim_{output_file}"
+                    # 对于临时文件，使用追加模式积累结果
+                    self._save_results_to_file(results, interim_file, mode="a")
+                    logger.info(f"已保存临时结果到: {interim_file}")
+
+        except Exception as e:
+            logger.error(f"批量处理过程中发生错误: {str(e)}")
+            # 取消剩余任务
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        # 使用指定模式保存最终结果
+        self._save_results_to_file(results, output_file, mode=file_mode)
+        logger.info(
+            f"处理完成，共处理 {len(results)} 个报告，结果保存到: {output_file}"
+        )
         return results
 
     @staticmethod
-    def _save_results_to_file(results: List[Dict[str, Any]], output_file: str):
-        """保存结果到JSON文件"""
+    def _save_results_to_file(
+        results: List[Dict[str, Any]], output_file: str, mode: str = "w"
+    ):
+        """保存结果到文件 - 支持追加模式和JSON Lines格式"""
         try:
             Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+
+            if mode == "a" and Path(output_file).exists():
+                # 读取现有数据
+                with open(output_file, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+
+                # 创建现有row_index集合用于去重
+                existing_indexes = {
+                    item["row_index"] for item in existing_data if "row_index" in item
+                }
+
+                # 从新结果中过滤掉重复项
+                new_results = [
+                    result
+                    for result in results
+                    if result.get("row_index") not in existing_indexes
+                ]
+
+                combined_results = existing_data + new_results
+            else:
+                combined_results = results
+
             with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False, default=str)
-            logger.info(f"结果已保存到: {output_file}")
+                json.dump(
+                    combined_results, f, indent=2, ensure_ascii=False, default=str
+                )
+
+            logger.info(
+                f"已保存 {len(combined_results)} 条结果到: {output_file} (模式: {mode})"
+            )
+
         except Exception as e:
             logger.error(f"保存文件失败: {str(e)}")
 
@@ -764,13 +626,12 @@ class ReportProcessingPipeline:
 
         for result in results:
             metadata = result["metadata"]
-            pathology_id = metadata.get(next(iter(metadata.keys()), "病理号"), "")
+            pathology_id = metadata.get("pathology_id")
 
             row_data = {
                 "row_index": result["row_index"],
                 "病理号": pathology_id,
                 "处理状态": "成功" if result.get("status") == "success" else "失败",
-                "提取的三元组数量": result.get("graph_triples_count", 0),
                 "错误信息": (
                     result.get("error", "") if result.get("status") == "error" else ""
                 ),
@@ -798,48 +659,132 @@ class ReportProcessingPipeline:
 # ====================================================================
 
 
-def main():
+async def main():
     """主执行函数"""
+    logger.info("*" * 64)
+    logger.info("Job Starting ...")
+    logger.info("*" * 64)
 
     # 1. 配置环境
     configure_environment()
-
-    # 2. 参数设置
-    CSV_FILE_PATH = "data/ruijin/Breast-20251021092802.xlsx"
-    TEXT_COLUMN = "病理诊断"
-    OUTPUT_JSON = "data/ruijin/pathology_extraction_results.json"
-    OUTPUT_CSV = "data/ruijin/pathology_extraction_summary.csv"
-    SAMPLE_SIZE = 5  # 开始时使用小样本测试
-    BATCH_SIZE = 10
 
     try:
         # 3. 实例化并加载数据
         pipeline = ReportProcessingPipeline(CSV_FILE_PATH)
         detected_columns = pipeline.detect_columns()
 
-        print("\n=== 列映射 ===")
+        logger.info(f"\n=== 列映射 ===")
         for std_name, actual_name in detected_columns.items():
-            print(f"   {std_name}: {actual_name}")
+            logger.info(f"   {std_name}: {actual_name}")
 
-        # 4. 批量处理
-        results = pipeline.process_reports_batch(
+        # 4. 批量处理（异步）
+        results = await pipeline.process_reports_batch(
             text_column=TEXT_COLUMN,
             output_file=OUTPUT_JSON,
             sample_size=SAMPLE_SIZE,
             batch_size=BATCH_SIZE,
+            max_concurrent=BATCH_SIZE,
+            file_mode="w",  # 最终文件使用覆盖模式
         )
 
         # 5. 汇总和导出
         summary = pipeline.generate_summary_report(results)
-        print("\n=== 处理摘要 ===")
+        logger.info(f"\n=== 处理摘要 ===")
         for key, value in summary.items():
-            print(f"{key}: {value}")
+            logger.info(f"{key}: {value}")
 
         pipeline.export_to_csv(results, OUTPUT_CSV)
-
+        logger.info("*" * 64)
+        logger.info("Job Done!")
+        logger.info("*" * 64)
     except (FileNotFoundError, ValueError, Exception) as e:
         logger.error(f"主程序执行失败: {str(e)}")
 
 
+def clean_report_text(text: str) -> str:
+    """
+    清洗和标准化病理报告文本。
+    主要包括：移除不可见字符、标准化空白和换行、移除外部引用、
+    标准化中英文标点符号和常用标记。
+    """
+    if not text:
+        return ""
+
+    # --- 1. 基础字符清理和标准化 ---
+    text = text.replace("\xa0", " ")  # 替换 &nbsp;
+    text = text.replace("\u3000", " ")  # 替换全角空格
+
+    # 移除标本类型中的引号（保留原有逻辑）
+    text = text.replace('标本类型："', "标本类型：")
+    text = text.replace('"标本类型：', "标本类型：")
+
+    # --- 2. 移除外部引用和非必要噪声 ---
+    # 移除或替换"请参见/详见报告FXXXX"等外部引用文本
+    # 这类文本对当前报告的实体提取无用
+    text = re.sub(
+        r"(请参见|详见)(病理)?报告[A-Z0-9-]+", "参考其他报告", text, flags=re.IGNORECASE
+    )
+
+    # --- 3. 标点符号和格式标准化 ---
+
+    # 统一全角冒号/分号/逗号为半角，并确保后面有空格
+    text = text.replace("：", ": ")
+    text = text.replace("；", "; ")
+    text = text.replace("，", ", ")
+    text = text.replace("。", ". ")
+    text = text.replace("（", "(")
+    text = text.replace("）", ")")
+    text = text.replace("“", "")
+    text = text.replace("”", "")
+
+    # 统一标准化常见的负号/阴性符号，便于模型识别
+    text = text.replace("(阴性)", "(-)")
+    text = text.replace("(阳性)", "(+)")
+
+    # --- 4. 空白和换行符处理 (精简文本) ---
+    text = text.replace("\n", "; ").replace("\r", "; ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s", "", text).strip()
+    text = re.sub(r";+", ";", text).strip()
+
+    text = text.replace(":;", ":无;")
+    text = text.replace(".;", ";")
+    return text
+
+
+def run_extraction_execution_native(
+    report_text: str, prompt: str, examples: list
+) -> Dict[str, Any]:
+    context_text = clean_report_text(report_text)
+    logger.debug(context_text)
+    result = lx.extract(
+        text_or_documents=context_text,
+        model_url=LLM_BASE_URL,
+        model_id=LLM_MODEL_ID,
+        api_key=LLM_API_KEY,
+        prompt_description=prompt,
+        examples=examples,
+        extraction_passes=3,  # Improves recall through multiple passes
+        max_workers=5,  # Parallel processing for speed
+        max_char_buffer=1000,  # Smaller contexts for better accuracy
+        use_schema_constraints=True,
+    )
+
+    return result
+
+
+async def run_extraction_execution_native_async(
+    report_text: str, prompt: str, examples: list
+) -> Dict[str, Any]:
+    """异步版本的提取执行函数"""
+    # 由于lx.extract可能是同步的，我们在线程池中运行它以避免阻塞事件循环
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: run_extraction_execution_native(report_text, prompt, examples)
+    )
+    return result
+
+
 if __name__ == "__main__":
-    main()
+    # 运行异步主函数
+    asyncio.run(main())

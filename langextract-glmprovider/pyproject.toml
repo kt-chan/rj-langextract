@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langextract-glmprovider"
+version = "0.1.0"
+description = "LangExtract provider plugin for glmProvider"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "langextract>=1.0.9",
+    "python-dotenv",
+    # Add your provider's SDK dependencies here
+]
+
+[project.entry-points."langextract.providers"]
+glmprovider = "langextract_glmprovider.provider:GLMProviderLanguageModel"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["langextract_glmprovider*"]

@@ -14,7 +14,7 @@ if (-not (Test-Path requirements.txt)) {
 $venvPath = ".\venv"
 if (Test-Path $venvPath) {
     Write-Host "Virtual environment exists at $venvPath. Checking if Python version is up to date..."
-    conda update --prefix $venvPath --yes python=3.10
+    conda install --prefix $venvPath --yes python=3.10
 } else {
     Write-Host "Creating conda environment at $venvPath..."
     conda create -p $venvPath  --yes python=3.10 
@@ -29,6 +29,15 @@ if (-not (Test-Path $pythonPath)) {
 # Install or upgrade all packages using uv with the specified Python
 Write-Host "Installing or upgrading packages with conda..."
 conda activate $venvPath
-pip install --upgrade -r requirements.txt -i https://mirrors.ustc.edu.cn/pypi/simple/ -i https://mirrors.ustc.edu.cn/anaconda/pkgs/free/ -i https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge/ --trusted-host mirrors.ustc.edu.cn
+pip install --upgrade -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple -i https://mirrors.ustc.edu.cn/pypi/simple/ -i https://mirrors.ustc.edu.cn/anaconda/pkgs/free/ -i https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge/ --trusted-host mirrors.ustc.edu.cn
+
+# Write-Host "Installing or upgrading langextract-glmprovider ..."
+
+# python -m pip install --upgrade pip setuptools wheel
+# pip install --upgrade --no-cache-dir -e langextract-glmprovider
+$env:SSL_CERT_FILE="D:\certs\ca-bundle.crt"
+$env:REQUESTS_CA_BUNDLE="D:\certs\ca-bundle.crt"
+$env:SETUPTOOLS_USE_DISTUTILS = "stdlib"
+pip install --upgrade --no-cache-dir --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple -e langextract-glmprovider
 
 Write-Host "Setup completed successfully."
